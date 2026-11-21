@@ -1350,9 +1350,10 @@ bool vk_low_ram(void) {
 }
 #define CHUNK_SIZE (vk_low_ram() ? 16ull << 20 : 64ull << 20)
 #define RING_KEEP (vk_low_ram() ? 2 : 4)
-typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame; } Chunk;  // frame: last picked
+typedef struct { VkBuffer buf; VmaAllocation mem; uint8_t *ptr; uint64_t size, used, seq, frame, gen; } Chunk;  // frame: last picked; gen: bumped on recycle
 static Chunk *chunks;
 static int nchunks, active = -1;
+static uint64_t chunk_gen_counter;
 
 static int new_chunk(uint64_t size) {
     chunks = realloc(chunks, (nchunks + 1) * sizeof *chunks);
@@ -1449,6 +1450,7 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     chunks[pick].used = size;
     chunks[pick].seq = pending;
     chunks[pick].frame = now;
+    chunks[pick].gen = ++chunk_gen_counter;
     stat_upload_bytes += size;
     return (VkSpan){chunks[pick].buf, 0, chunks[pick].ptr};
 }
@@ -1522,16 +1524,30 @@ static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t al
     return s;
 }
 
-// Guest memory copied once per submission: draws binding the same range share the copy.
-#define GCOPY_TAB 4096
-static struct { uint64_t addr, size, seq; VkSpan span; } gcopy[GCOPY_TAB];
+// Guest memory copied once per submission (or across mid-list chunk submits on Mali-G925, LARECOMP_VK_GCOPY_LIST=1):
+// draws binding the same range share the copy. Chunk lifetime is guarded by Chunk.gen + bumping Chunk.seq on hit.
+#define GCOPY_TAB 8192
+static struct { uint64_t addr, size, seq, cgen; int cidx; VkSpan span; } gcopy[GCOPY_TAB];
 static uint16_t gcopy_active[GCOPY_TAB];
 static int gcopy_nactive;
 static uint64_t gcopy_active_seq;
-static uint64_t gcopy_gen;  // bumped to drop every shared copy (guest memory written mid-list)
+static uint64_t gcopy_gen;       // bumped to drop every shared copy (guest memory written mid-list)
+static uint64_t gcopy_list_seq;  // bumped at each top-level vk_execute_now (safe across mid-list chunk submits)
+static bool gcopy_list_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("LARECOMP_VK_GCOPY_LIST");
+        bool mali_g925 = g_vk.props.vendorID == 0x13B5 && strstr(g_vk.props.deviceName, "G925") != NULL;
+        on = e ? (atoi(e) != 0) : (mali_g925 ? 1 : 0);
+    }
+    return on != 0;
+}
+static inline uint64_t gcopy_cur_seq(void) {
+    return (gcopy_list_on() ? (gcopy_list_seq + 1) : vk_pending_seq()) + (gcopy_gen << 40);
+}
 static void guest_copy_flush(void) { gcopy_gen++; gcopy_nactive = 0; }
 static void guest_copy_invalidate(uint64_t lo, uint64_t hi) {
-    uint64_t seq = vk_pending_seq() + (gcopy_gen << 40);
+    uint64_t seq = gcopy_cur_seq();
     if (gcopy_active_seq != seq) return;
     for (int i = 0; i < gcopy_nactive; i++) {
         uint16_t s = gcopy_active[i];
@@ -1589,12 +1605,29 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size, int kind) {
         static int nlog;
         if (nlog++ < 8) LOG("[vk] uniforms at %llx read before a GPU buffer copy into them lands (offset not aligned)\n", (unsigned long long)addr);
     }
-    uint64_t seq = vk_pending_seq() + (gcopy_gen << 40), h = addr * 0x9E3779B97F4A7C15ull;
+    uint64_t pend = vk_pending_seq();
+    uint64_t seq = gcopy_cur_seq(), h = addr * 0x9E3779B97F4A7C15ull;
     if (gcopy_active_seq != seq) { gcopy_active_seq = seq; gcopy_nactive = 0; }
-    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1);
-    if (gcopy[slot].seq == seq && gcopy[slot].addr == addr && (gcopy[slot].size == size || (gcopy[slot].size > size && AB("gcreuse") != 0))) {
-        prof_gcopy_reused += size;
-        return gcopy[slot].span;
+    uint32_t base_slot = (uint32_t)(h ^ (h >> 32)) & (GCOPY_TAB - 1), slot = base_slot;
+    int ab_gc = AB("gcreuse");
+    for (uint32_t p = 0; p < 4; p++) {
+        uint32_t s = (base_slot + p) & (GCOPY_TAB - 1);
+        if (gcopy[s].seq == seq && gcopy[s].addr == addr &&
+            (gcopy[s].size == size || (gcopy[s].size > size && ab_gc != 0))) {
+            int ci = gcopy[s].cidx;
+            if (ci < 0 || ci >= nchunks || chunks[ci].buf != gcopy[s].span.buf) {
+                ci = -1;
+                for (int k = 0; k < nchunks; k++)
+                    if (chunks[k].buf == gcopy[s].span.buf) { ci = k; gcopy[s].cidx = k; break; }
+            }
+            if (ci >= 0 && chunks[ci].gen == gcopy[s].cgen) {
+                if (chunks[ci].seq < pend) chunks[ci].seq = pend;
+                prof_gcopy_reused += size;
+                return gcopy[s].span;
+            }
+            gcopy[s].seq = 0;  // chunk was recycled/destroyed: re-copy safely
+        }
+        if (gcopy[s].seq != seq && slot == base_slot && p > 0) slot = s;
     }
     prof_gcopy_bytes += size;
     prof_gcopy_kind[kind] += size;
@@ -1608,9 +1641,11 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size, int kind) {
     if (log_copy_from < 0) { const char *e = getenv("LARECOMP_LOG_GUEST_COPY_FROM"); log_copy_from = e ? atol(e) : 0; }
     if (log_copy && renderer_present_count() >= (uint64_t)log_copy_from && size >= 65536 && logged_copy++ < 32)
         LOG("[guest-copy] addr %llx size %llu seq %llu\n", (unsigned long long)addr,
-            (unsigned long long)size, (unsigned long long)vk_pending_seq());
+            (unsigned long long)size, (unsigned long long)pend);
     stat_cb_copied += size;
     gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq; gcopy[slot].span = s;
+    gcopy[slot].cidx = active;
+    gcopy[slot].cgen = active >= 0 && active < nchunks ? chunks[active].gen : 0;
     return s;
 }
 
@@ -4974,13 +5009,24 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
             }
             float g = widescreen_factor();
             if ((widescreen_allowed() && g > 1.001f) || dy != 0) {
-                VkSpan c = vk_transient_copy(f, size, 256);
-                float *m = (float *)c.ptr;
+                // Stage matrix patches in L1-cached stack memory before one sequential write to Write-Combined
+                // transient memory (avoids ARM64 WC read-modify-write stalls on memory type 0).
+                uint8_t stack_buf[1024];
+                VkSpan c = {0};
+                float *m = NULL;
+                if (size <= sizeof stack_buf) {
+                    memcpy(stack_buf, f, (size_t)size);
+                    m = (float *)stack_buf;
+                } else {
+                    c = vk_transient_copy(f, size, 256);
+                    m = (float *)c.ptr;
+                }
                 if (!(widescreen_allowed() && g > 1.001f)) g = 1.0f;
                 for (int i = 0; i < 4; i++) m[i] /= g;
                 if (size >= 0x230 && f[132] >= 1919.5f && fabsf(f[134] + f[132] * 0.5f) < 0.5f && fabsf(f[19]) < 1.0f)
                     for (int i = 16; i < 20; i++) m[i] *= g;
                 m[23] += dy;
+                if (!c.ptr) c = vk_transient_copy(stack_buf, size, 256);
                 return ubo_span(c, size);
             }
         }
@@ -7175,12 +7221,19 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
             else { DS_MIX((uintptr_t)w[i].pBufferInfo->buffer); DS_MIX(w[i].pBufferInfo->offset); DS_MIX(w[i].pBufferInfo->range); }
         }
 #undef DS_MIX
-        static struct { uint64_t seq, h1, h2; VkDescriptorSet ds; } cache[4096];
+        // 4-way set-associative descriptor set cache (1024 sets x 4 ways = 4096 entries, same memory footprint
+        // as the old direct-mapped table; eliminates conflict misses across multi-material draws).
+        static struct { uint64_t seq, h1, h2; VkDescriptorSet ds; } cache[1024][4];
+        static uint8_t rr[1024];
         uint64_t seq = vk_pending_seq();
-        uint32_t slot = (uint32_t)(h1 ^ (h1 >> 32)) & 4095;
-        if (!off && cache[slot].seq == seq && cache[slot].h1 == h1 && cache[slot].h2 == h2) {
-            prof_set_hits++;
-            return cache[slot].ds;
+        uint32_t set_idx = (uint32_t)(h1 ^ (h1 >> 32)) & 1023;
+        if (!off) {
+            for (int way = 0; way < 4; way++) {
+                if (cache[set_idx][way].seq == seq && cache[set_idx][way].h1 == h1 && cache[set_idx][way].h2 == h2) {
+                    prof_set_hits++;
+                    return cache[set_idx][way].ds;
+                }
+            }
         }
         prof_set_miss++;
         uint64_t tw_ = prof > 0 ? plat_now_ns() : 0;
@@ -7188,7 +7241,15 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         for (int i = 0; i < n; i++) w[i].dstSet = ds;
         if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
         if (prof > 0) prof_dsw += plat_now_ns() - tw_;
-        cache[slot].seq = seq, cache[slot].h1 = h1, cache[slot].h2 = h2, cache[slot].ds = ds;
+        int victim = -1;
+        for (int way = 0; way < 4; way++) {
+            if (cache[set_idx][way].seq != seq) { victim = way; break; }
+        }
+        if (victim < 0) victim = (rr[set_idx]++) & 3;
+        cache[set_idx][victim].seq = seq;
+        cache[set_idx][victim].h1 = h1;
+        cache[set_idx][victim].h2 = h2;
+        cache[set_idx][victim].ds = ds;
         return ds;
     }
 #else
@@ -9856,6 +9917,7 @@ void backend_execute(uint64_t handle) {
     static int log_lists = -1;  // LARECOMP_LOG_LISTS=1: the command lists of one frame in 120 (draws, passes, time)
     if (log_lists < 0) log_lists = getenv("LARECOMP_LOG_LISTS") != NULL;
     uint64_t ll_d = stat_draws, ll_p = stat_passes, ll_t = log_lists ? plat_now_ns() : 0;
+    gcopy_list_seq++;
     exec_list(handle, 0);
     if (log_lists && renderer_present_count() % 120 == 0)
         LOG("[lists] frame %llu: list %llx %llu draws %llu passes %.2f ms\n", (unsigned long long)renderer_present_count(),
