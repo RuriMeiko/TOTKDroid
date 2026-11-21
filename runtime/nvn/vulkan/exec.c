@@ -536,13 +536,21 @@ void vk_pace_frame(void) {
     // comfortable, the clocks stayed low and so did the mode)
     static int follow = -1;  // LARECOMP_ADPF_FOLLOW=1: the old target (the mode's own)
     if (follow < 0) follow = getenv("LARECOMP_ADPF_FOLLOW") != NULL;
-    {   // LARECOMP_ADPF_GPU=1 (a test): the GPU's time too (API 35+), so its governor would raise its clock for 60 fps
-        // as well. Accepted on the Snapdragon 8 Elite (2026-10-16) but nothing measurable changed: off by default.
+    {   // LARECOMP_ADPF_GPU=0/1: include GPU duration via API 35+ reportActualWorkDuration2().
+        // Off by default on Adreno (no measurable change on 8 Elite); ON by default on ARM Mali (0x13B5) so
+        // MediaTek ged/fpsgo & Mali DVFS receive separated CPU/GPU durations instead of over-boosting CPUs.
         static int no_gpu = -1;
-        if (no_gpu < 0) no_gpu = getenv("LARECOMP_ADPF_GPU") == NULL;
-        static uint64_t last_busy;
+        if (no_gpu < 0) {
+            const char *ge = getenv("LARECOMP_ADPF_GPU");
+            bool mali = g_vk.props.vendorID == 0x13B5;
+            no_gpu = ge ? (atoi(ge) == 0) : !mali;
+        }
+        static uint64_t last_busy, last_gpu_wait;
         uint64_t total = gpu_busy_total, gpu = total - last_busy;
         last_busy = total;
+        uint64_t cur_wait = cum_wait;
+        uint64_t gpu_wt = cur_wait >= last_gpu_wait ? cur_wait - last_gpu_wait : 0;
+        last_gpu_wait = cur_wait;
         g_pace_gpu_ms = gpu / 1e6;
         // (per presented frame, against 60 fps's budget in either mode: a 30 fps frame renders one image too - its GPU
         // time is what a 60 fps frame would take, and halved it looked comfortable: the clock stayed low)
@@ -551,16 +559,16 @@ void vk_pace_frame(void) {
         double hint_busy = game_busy;
         double render_cpu = vk_async_on() ? vk_async_frame_cpu_ns() / 1e6 : 0;
         if (render_cpu > hint_busy) hint_busy = render_cpu;
-        // The frame's whole period but its wait for the present's vsync, and the game's busiest threads in the
-        // session: its frame waits on its job workers (a 25 ms frame was ~9 ms of the two threads' own work, ~20 ms
-        // waiting for the workers), and that work never showed - the session saw headroom, the CPUs stayed at
-        // ~2.4 GHz. LARECOMP_ADPF_PERIOD=0: the threads' own work only, as before; LARECOMP_AB=<n>:adpfw alternates.
+        // The frame's whole period minus vsync AND GPU fence wait (SyncWait): captures guest job-worker CPU time
+        // while never counting GPU wait as CPU work (which drove an ADPF CPU-overboost death spiral on Mali/Dimensity
+        // at ~40C skin). LARECOMP_ADPF_PERIOD=0: threads' own CPU work only; LARECOMP_AB=<n>:adpfw alternates.
         static int adpf_period = -1;
         if (adpf_period < 0) adpf_period = !getenv("LARECOMP_ADPF_PERIOD") || atoi(getenv("LARECOMP_ADPF_PERIOD")) != 0;
         int abw = AB("adpfw");
         if (abw >= 0 ? abw == 1 : adpf_period) {
             extern uint64_t g_present_vsync_wait_ns;  // (nvn/objects.c: this frame's wait for the vsync grid)
-            uint64_t crit = p > g_present_vsync_wait_ns ? p - g_present_vsync_wait_ns : 0;
+            uint64_t wait_tot = g_present_vsync_wait_ns + gpu_wt;
+            uint64_t crit = p > wait_tot ? p - wait_tot : 0;
             if (crit / 1e6 > hint_busy) hint_busy = crit / 1e6;
             static uint64_t hot_at;
             if (renderer_present_count() >= hot_at) {
