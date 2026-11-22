@@ -10,11 +10,11 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #ifdef __ANDROID__
-#include <errno.h>
 #include <sys/mman.h>
 #endif
 
@@ -1656,9 +1656,28 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size, int kind) {
 // First-use compiles run off the render thread; draws needing them are skipped until ready (as on Metal).
 // LARECOMP_SYNC_SHADERS=1 builds on first use, blocking (deterministic tests).
 typedef struct Job { void (*fn)(void *); void *arg; struct Job *next; } Job;
-static Job *jobs_head, *jobs_tail;
+static Job *jobs_head[2], *jobs_tail[2];  // 1: high priority (waited-on keep draw), 0: normal
 static pthread_mutex_t jobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t jobs_cond = PTHREAD_COND_INITIALIZER;
+
+static inline bool has_job_locked(Job *const head[2]) { return head[1] || head[0]; }
+static Job *pop_job_locked(Job *head[2], Job *tail[2]) {
+    for (int pr = 1; pr >= 0; pr--) {
+        if (head[pr]) {
+            Job *j = head[pr];
+            head[pr] = j->next;
+            if (!head[pr]) tail[pr] = NULL;
+            return j;
+        }
+    }
+    return NULL;
+}
+static void push_job_locked(Job *head[2], Job *tail[2], Job *j, bool high) {
+    int pr = high ? 1 : 0;
+    j->next = NULL;
+    if (tail[pr]) tail[pr]->next = j; else head[pr] = j;
+    tail[pr] = j;
+}
 
 // Admission gate: how many compiles run at once (from Swap2-Native's vka_psogate.h / vka_pso.c gate_slots). A compile
 // takes the driver hundreds of MB and, on Turnip, thousands of memory mappings (Swap2: three long ones took 58,619 of
@@ -1744,12 +1763,12 @@ static void *worker(void *a) {
     vk_fp_thread("vk-compile");  // (made from a game thread: its FPCR - vk_fpenv.h)
     for (;;) {
         pthread_mutex_lock(&jobs_lock);
-        while (!jobs_head) pthread_cond_wait(&jobs_cond, &jobs_lock);
+        while (!has_job_locked(jobs_head)) pthread_cond_wait(&jobs_cond, &jobs_lock);
         if (!g_gate_off) {
             pthread_mutex_unlock(&jobs_lock);
             gate_refresh();  // (rate-limited; the /proc reads outside the lock)
             pthread_mutex_lock(&jobs_lock);
-            if (!jobs_head) { pthread_mutex_unlock(&jobs_lock); continue; }  // (another worker took it)
+            if (!has_job_locked(jobs_head)) { pthread_mutex_unlock(&jobs_lock); continue; }  // (another worker took it)
             if (!atomic_load(&g_urgent) && g_gate_active >= atomic_load(&g_gate_slots)) {
                 // (timed: memory freed elsewhere raises the slots without a job finishing)
                 struct timespec ts;
@@ -1761,9 +1780,7 @@ static void *worker(void *a) {
                 continue;
             }
         }
-        Job *j = jobs_head;
-        jobs_head = j->next;
-        if (!jobs_head) jobs_tail = NULL;
+        Job *j = pop_job_locked(jobs_head, jobs_tail);
         g_gate_active++;
         pthread_mutex_unlock(&jobs_lock);
         j->fn(j->arg);
@@ -1785,7 +1802,7 @@ static bool sync_shaders(void) {
 // Shader translation: one dedicated thread (the translator isn't re-entrant - translate.c's RSC2 string ring - and
 // translating on the game thread cost up to ~90 ms per frame on entering an area). Compiles go on to the workers.
 static pthread_mutex_t translate_lock = PTHREAD_MUTEX_INITIALIZER;  // graphics and compute share translator globals
-static Job *tjobs_head, *tjobs_tail;
+static Job *tjobs_head[2], *tjobs_tail[2];
 static pthread_mutex_t tjobs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t tjobs_cond = PTHREAD_COND_INITIALIZER;
 static void *translator(void *a) {
@@ -1793,10 +1810,8 @@ static void *translator(void *a) {
     vk_fp_thread("vk-translate");
     for (;;) {
         pthread_mutex_lock(&tjobs_lock);
-        while (!tjobs_head) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
-        Job *j = tjobs_head;
-        tjobs_head = j->next;
-        if (!tjobs_head) tjobs_tail = NULL;
+        Job *j;
+        while (!(j = pop_job_locked(tjobs_head, tjobs_tail))) pthread_cond_wait(&tjobs_cond, &tjobs_lock);
         pthread_mutex_unlock(&tjobs_lock);
         j->fn(j->arg);
         free(j);
@@ -1804,20 +1819,20 @@ static void *translator(void *a) {
     return NULL;
 }
 static bool sync_shaders(void);
-static void run_translate(void (*fn)(void *), void *arg) {
+static void run_translate_prio(void (*fn)(void *), void *arg, bool high) {
     if (sync_shaders()) { fn(arg); return; }
     static bool started;
     if (!started) { started = true; pthread_t t; pthread_create(&t, NULL, translator, NULL); }
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
     pthread_mutex_lock(&tjobs_lock);
-    if (tjobs_tail) tjobs_tail->next = j; else tjobs_head = j;
-    tjobs_tail = j;
+    push_job_locked(tjobs_head, tjobs_tail, j, high);
     pthread_cond_signal(&tjobs_cond);
     pthread_mutex_unlock(&tjobs_lock);
 }
+static void run_translate(void (*fn)(void *), void *arg) { run_translate_prio(fn, arg, false); }
 
-static void run_job(void (*fn)(void *), void *arg) {
+static void run_job_prio(void (*fn)(void *), void *arg, bool high) {
     if (sync_shaders()) { fn(arg); return; }
     static bool started;
     if (!started) {
@@ -1843,10 +1858,20 @@ static void run_job(void (*fn)(void *), void *arg) {
     Job *j = malloc(sizeof *j);
     j->fn = fn; j->arg = arg; j->next = NULL;
     pthread_mutex_lock(&jobs_lock);
-    if (jobs_tail) jobs_tail->next = j; else jobs_head = j;
-    jobs_tail = j;
+    push_job_locked(jobs_head, jobs_tail, j, high);
     pthread_cond_signal(&jobs_cond);
     pthread_mutex_unlock(&jobs_lock);
+}
+static void run_job(void (*fn)(void *), void *arg) { run_job_prio(fn, arg, false); }
+
+// Condvar completion wakeup for shader/pipeline builds (replaces usleep(200) polling in wait_built).
+static pthread_mutex_t build_done_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t build_done_cond = PTHREAD_COND_INITIALIZER;
+static void build_signal_done(_Atomic int *state, int val) {
+    pthread_mutex_lock(&build_done_lock);
+    atomic_store_explicit(state, val, memory_order_release);
+    pthread_cond_broadcast(&build_done_cond);
+    pthread_mutex_unlock(&build_done_lock);
 }
 
 // A skipped draw is lost for good when its target is built once and kept: BOTW's terrain height array (1024x1024x8,
@@ -1855,13 +1880,16 @@ static void run_job(void (*fn)(void *), void *arg) {
 // shader and pipeline instead (LARECOMP_WAIT_PERSISTENT=0: skip them like the rest).
 static uint64_t stat_build_wait_ns;
 static void wait_built(_Atomic int *state) {
-    if (atomic_load(state)) return;
+    if (atomic_load_explicit(state, memory_order_acquire)) return;
     uint64_t t0 = plat_now_ns();
     atomic_fetch_add(&g_urgent, 1);  // (the compile gate lets every build start meanwhile)
     pthread_mutex_lock(&jobs_lock);
     pthread_cond_broadcast(&jobs_cond);
     pthread_mutex_unlock(&jobs_lock);
-    while (!atomic_load(state)) usleep(200);
+    pthread_mutex_lock(&build_done_lock);
+    while (!atomic_load_explicit(state, memory_order_acquire))
+        pthread_cond_wait(&build_done_cond, &build_done_lock);
+    pthread_mutex_unlock(&build_done_lock);
     atomic_fetch_sub(&g_urgent, 1);
     stat_build_wait_ns += plat_now_ns() - t0;
 }
@@ -2170,7 +2198,7 @@ static void noatt_dims(uint32_t *w, uint32_t *h) {
 // LARECOMP_VK_STATE_FILTER=0: every draw sets everything, as before.
 enum { SS_PIPE = 1 << 0, SS_DT = 1 << 1, SS_DW = 1 << 2, SS_DOP = 1 << 3, SS_STEN = 1 << 4, SS_SFACE0 = 1 << 5, SS_SFACE1 = 1 << 6,
        SS_BC = 1 << 7, SS_CULL = 1 << 8, SS_FF = 1 << 9, SS_TOPO = 1 << 10, SS_PRE = 1 << 11, SS_DBE = 1 << 12, SS_DB = 1 << 13,
-       SS_VP = 1 << 14, SS_SC = 1 << 15, SS_IB = 1 << 16, SS_SETS = 1 << 17 };
+       SS_VP = 1 << 14, SS_SC = 1 << 15, SS_IB = 1 << 16, SS_SETS = 1 << 17, SS_VTXIN = 1 << 18 };
 static struct {
     uint32_t known;  // SS_* bits: the value below is what the command buffer has
     uint32_t vb_known;  // per vertex binding
@@ -2188,6 +2216,9 @@ static struct {
     VkBuffer vb[17]; VkDeviceSize vo[17];
     VkPipelineLayout layout; VkDescriptorSet sets[2];  // (SS_SETS: the graphics sets bound and their layout,
     uint32_t ndyn, dyn[64];                             // and their dynamic uniform buffer offsets)
+    uint32_t vtx_nb, vtx_na;
+    VkVertexInputBindingDescription2EXT vtx_b[17];
+    VkVertexInputAttributeDescription2EXT vtx_a[32];
 } ss;
 static int ss_on = -1;
 static void ss_forget(void) { ss.known = 0; ss.vb_known = 0; }
@@ -3303,6 +3334,8 @@ static void clear(int index, int kind, const void *color, uint32_t mask, bool de
 
 // ================================================================== programs
 #define MAX_BIND 96
+static bool is_ubo(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; }
+
 #ifdef __ANDROID__
 // Reflection is immutable once a program is published. Partition its bindings once, rather than scanning both
 // stages twice per draw. Only metadata is reused: live buffers, texture views and UBO contents are still resolved.
@@ -3313,11 +3346,66 @@ static void descriptor_plan(const VkBindingInfo *binds, int count, uint32_t set,
         const VkBindingInfo *b = &binds[i];
         if (b->set != set) continue;
         if (((b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER || b->type == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT) && b->binding >= 32) ||
-            (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
+            (is_ubo(b->type) && b->binding < 17) || b->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER)
             plan->regular[plan->nregular++] = (uint8_t)i;
-        else if (b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+        else if (is_ubo(b->type) &&
                  (b->binding == 18 || b->binding == 19 || b->binding == GMAP_BUFFER_INDEX || b->binding == CBPATCH_BUFFER_INDEX))
             plan->deferred[plan->ndeferred++] = (uint8_t)i;
+    }
+}
+
+typedef union {
+    VkDescriptorBufferInfo b;
+    VkDescriptorImageInfo i;
+} DescTplSlot;
+
+static int desc_tpl_flag;
+static pthread_once_t desc_tpl_once = PTHREAD_ONCE_INIT;
+static void desc_tpl_init(void) {
+    const char *e = getenv("LARECOMP_VK_DESC_TEMPLATE");
+    bool want = e ? (atoi(e) != 0) : true;
+    desc_tpl_flag = want && g_vk.api >= VK_API_VERSION_1_1 && vkCreateDescriptorUpdateTemplate &&
+                    vkUpdateDescriptorSetWithTemplate;
+    LOG("[vk] descriptor update templates: %s\n", desc_tpl_flag ? "on" : "off");
+}
+static bool desc_tpl_on(void) {
+    pthread_once(&desc_tpl_once, desc_tpl_init);
+    return desc_tpl_flag != 0;
+}
+
+static void make_desc_templates(const VkDescriptorSetLayout *set_layout, const VkBindingInfo *binds,
+                                const DescriptorPlan *plans, int nsets, VkDescriptorUpdateTemplate out[2]) {
+    out[0] = out[1] = VK_NULL_HANDLE;
+    if (!desc_tpl_on()) return;
+    for (int s = 0; s < nsets && s < 2; s++) {
+        const DescriptorPlan *pl = &plans[s];
+        uint32_t count = (uint32_t)(pl->nregular + pl->ndeferred);
+        if (!count || count > MAX_BIND || !set_layout[s]) continue;
+        VkDescriptorUpdateTemplateEntry entries[MAX_BIND];
+        uint32_t k = 0;
+        for (int i = 0; i < pl->nregular; i++, k++) {
+            const VkBindingInfo *b = &binds[pl->regular[i]];
+            entries[k] = (VkDescriptorUpdateTemplateEntry){
+                .dstBinding = b->binding, .dstArrayElement = 0, .descriptorCount = 1,
+                .descriptorType = b->type, .offset = (size_t)k * sizeof(DescTplSlot), .stride = sizeof(DescTplSlot),
+            };
+        }
+        for (int i = 0; i < pl->ndeferred; i++, k++) {
+            const VkBindingInfo *b = &binds[pl->deferred[i]];
+            entries[k] = (VkDescriptorUpdateTemplateEntry){
+                .dstBinding = b->binding, .dstArrayElement = 0, .descriptorCount = 1,
+                .descriptorType = b->type, .offset = (size_t)k * sizeof(DescTplSlot), .stride = sizeof(DescTplSlot),
+            };
+        }
+        VkDescriptorUpdateTemplateCreateInfo tci = {
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO,
+            .descriptorUpdateEntryCount = count,
+            .pDescriptorUpdateEntries = entries,
+            .templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET,
+            .descriptorSetLayout = set_layout[s],
+        };
+        if (vkCreateDescriptorUpdateTemplate(g_vk.dev, &tci, NULL, &out[s]) != VK_SUCCESS)
+            out[s] = VK_NULL_HANDLE;
     }
 }
 #endif
@@ -3331,10 +3419,12 @@ typedef struct {
     int nbinds;
 #ifdef __ANDROID__
     DescriptorPlan descriptor_plans[2];
+    VkDescriptorUpdateTemplate desc_tpl[2];
 #endif
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout;
     bool vs_uses_vid;
+    bool high_prio;
     uint32_t fs_out_mask;  // fi->out_mask: the render targets the fragment shader writes (read by every draw; in
                            // ShaderInfo it sits 1.4 KB in, past the 64 textures - a cache miss each draw, ~7% of the
                            // render thread on the POCO F7 Ultra: draw_writes)
@@ -3355,6 +3445,9 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
 #endif
     p->set_layout[0] = vk_set_layout(p->binds, p->nbinds, 0, s0);
     if (nsets > 1) p->set_layout[1] = vk_set_layout(p->binds, p->nbinds, 1, s1);
+#ifdef __ANDROID__
+    make_desc_templates(p->set_layout, p->binds, p->descriptor_plans, nsets, p->desc_tpl);
+#endif
     VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nsets,
                                      .pSetLayouts = p->set_layout};
     VkPipelineLayout l;
@@ -3415,7 +3508,7 @@ static void compile_program(void *arg) {
     size_t nv = 0, nf = 0;
     uint32_t *sv = vk_glsl_to_spirv(p->vi->msl, STAGE_VERTEX, "vs", &nv);
     uint32_t *sf = sv ? vk_glsl_to_spirv(p->fi->msl, STAGE_FRAGMENT, "fs", &nf) : NULL;
-    if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
+    if (!sv || !sf) { free(sv); free(sf); build_signal_done(&p->state, 2); return; }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -3426,7 +3519,7 @@ static void compile_program(void *arg) {
         if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
         if (p->fs) vkDestroyShaderModule(g_vk.dev, p->fs, NULL);
         p->vs = p->fs = VK_NULL_HANDLE;
-        atomic_store(&p->state, 2);
+        build_signal_done(&p->state, 2);
         return;
     }
 #ifdef __ANDROID__
@@ -3452,7 +3545,7 @@ static void compile_program(void *arg) {
     p->layout = make_layout(p, 2, VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT);
     atomic_fetch_add(&stat_compiles, 1);
     atomic_fetch_add(&live_programs, 1);
-    atomic_store(&p->state, p->vs && p->fs ? 1 : 2);
+    build_signal_done(&p->state, p->vs && p->fs ? 1 : 2);
 }
 
 #ifdef __ANDROID__
@@ -3524,12 +3617,12 @@ static void translate_program(void *arg) {
     pthread_mutex_unlock(&translate_lock);
     if (!p->vi->msl) {
         LOG("[shader] VS translate failed: %s (code %llx)\n", p->vi->error, (unsigned long long)p->code[0]);
-        atomic_store(&p->state, 2);
+        build_signal_done(&p->state, 2);
         return;
     }
     if (!p->fi->msl) {
         LOG("[shader] FS translate failed: %s\n", p->fi->error);
-        atomic_store(&p->state, 2);
+        build_signal_done(&p->state, 2);
         return;
     }
 #ifdef __ANDROID__
@@ -3571,7 +3664,7 @@ static void translate_program(void *arg) {
     }
     save_glsl(p->vi->msl, p->code[0], "vs");
     save_glsl(p->fi->msl, p->code[1], "fs");
-    run_job(compile_program, p);
+    run_job_prio(compile_program, p, p->high_prio);
 }
 
 // Growable (object_cache.h, from BOTWRecomp 848e08c): the fixed 4096-entry table's probe never ended once full.
@@ -3583,7 +3676,7 @@ static Prog *prog_used(Prog *p) {
     return p;
 }
 
-static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
+static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey, bool high) {
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
     // (the previous draw's program and keys again - most draws: no hashing; the code addresses are part of it, as
     // the program object can be reused for other code)
@@ -3620,7 +3713,8 @@ static Prog *get_program(NvnProgram *np, ShaderKey *vkey, ShaderKey *fkey) {
     }
     p->vkey = *vkey;
     p->fkey = *fkey;
-    run_translate(translate_program, p);
+    p->high_prio = high;
+    run_translate_prio(translate_program, p, high);
     return p;
 }
 
@@ -3965,8 +4059,12 @@ static void prog_free(Prog *p) {
         vkDestroyPipelineLayout(g_vk.dev, p->layout, NULL);
         atomic_fetch_sub(&live_programs, 1);  // (counted where compile_program made it)
     }
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 2; i++) {
+#ifdef __ANDROID__
+        if (p->desc_tpl[i]) vkDestroyDescriptorUpdateTemplate(g_vk.dev, p->desc_tpl[i], NULL);
+#endif
         if (p->set_layout[i]) vkDestroyDescriptorSetLayout(g_vk.dev, p->set_layout[i], NULL);
+    }
     maxwell_free(p->vi);
     maxwell_free(p->fi);
     free(p);
@@ -4077,13 +4175,15 @@ static void build_pipeline(void *arg) {
     VkVertexInputBindingDescription vb[17];
     VkVertexInputBindingDivisorDescriptionEXT vd[17];
     uint32_t na = 0, nb = 0, nd = 0;
-    for (int i = 0; i < 32; i++)
-        if (k->attr_mask & (1u << i)) va[na++] = (VkVertexInputAttributeDescription){(uint32_t)i, k->attr_bind[i], k->attr_fmt[i], k->attr_off[i]};
-    for (uint32_t s = 0; s < 17; s++) {
-        if (!(k->used_streams & (1u << s))) continue;
-        bool inst = k->divisor[s] != 0;
-        vb[nb++] = (VkVertexInputBindingDescription){s, k->stride[s], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
-        if (inst && k->divisor[s] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){s, k->divisor[s]};
+    if (!g_vk.dyn_vtx_input) {
+        for (int i = 0; i < 32; i++)
+            if (k->attr_mask & (1u << i)) va[na++] = (VkVertexInputAttributeDescription){(uint32_t)i, k->attr_bind[i], k->attr_fmt[i], k->attr_off[i]};
+        for (uint32_t s = 0; s < 17; s++) {
+            if (!(k->used_streams & (1u << s))) continue;
+            bool inst = k->divisor[s] != 0;
+            vb[nb++] = (VkVertexInputBindingDescription){s, k->stride[s], inst ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX};
+            if (inst && k->divisor[s] > 1 && g_vk.divisor) vd[nd++] = (VkVertexInputBindingDivisorDescriptionEXT){s, k->divisor[s]};
+        }
     }
     VkPipelineVertexInputDivisorStateCreateInfoEXT dvi = {.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_EXT,
                                                           .vertexBindingDivisorCount = nd, .pVertexBindingDivisors = vd};
@@ -4119,8 +4219,12 @@ static void build_pipeline(void *arg) {
                                               .attachmentCount = k->ncolor, .pAttachments = cba};
     if (crp && vk_roaa_for(k->ncolor) && g_vk.roaa_color && k->ncolor && (!vk_selective_roaa_on() || k->roaa_color))
         cb.flags |= VK_PIPELINE_COLOR_BLEND_STATE_CREATE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_BIT_EXT;
+    VkDynamicState dyn_list[24];
+    uint32_t ndyn = (uint32_t)NDYN;
+    memcpy(dyn_list, DYN, ndyn * sizeof dyn_list[0]);
+    if (g_vk.dyn_vtx_input) dyn_list[ndyn++] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT;
     VkPipelineDynamicStateCreateInfo dy = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
-                                           .dynamicStateCount = NDYN, .pDynamicStates = DYN};
+                                           .dynamicStateCount = ndyn, .pDynamicStates = dyn_list};
     if (k->fx.on) {  // (no extended dynamic state: the draw's own, PipeFx)
         const PipeFx *x = &k->fx;
         ia.topology = (VkPrimitiveTopology)x->topo;
@@ -4137,7 +4241,7 @@ static void build_pipeline(void *arg) {
                                         .pColorAttachmentFormats = k->color, .depthAttachmentFormat = k->depth,
                                         .stencilAttachmentFormat = k->stencil};
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 2,
-                                       .pStages = stages, .pVertexInputState = &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
+                                       .pStages = stages, .pVertexInputState = g_vk.dyn_vtx_input ? NULL : &vi, .pInputAssemblyState = &ia, .pViewportState = &vs,
                                        .pRasterizationState = &rs, .pMultisampleState = &ms, .pDepthStencilState = &ds,
                                        .pColorBlendState = &cb, .pDynamicState = &dy, .layout = k->prog->layout};
     if (crp) pi.pNext = ri.pNext, pi.renderPass = crp;
@@ -4192,7 +4296,7 @@ static void build_pipeline(void *arg) {
         if (n++ < 20) LOG("[vk] graphics pipeline failed (%d): vs %llx fs %llx\n", (int)r,
                           (unsigned long long)k->prog->code[0], (unsigned long long)k->prog->code[1]);
     }
-    atomic_store(&pp->state, r == VK_SUCCESS ? 1 : 2);
+    build_signal_done(&pp->state, r == VK_SUCCESS ? 1 : 2);
 }
 
 // ================================================================== feedback snapshots (renderer.m resolve_feedback)
@@ -7323,7 +7427,7 @@ static void texture_info(int stage, ShaderInfo *si, int i, VkDescriptorImageInfo
 // viewport decision), or NULL.
 static float g_mirror_w;  // mirror mode's composite: its render target width (rscale[65].x; 0 otherwise)
 
-static bool is_ubo(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER || t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC; }
+// is_ubo() defined above descriptor_plan()
 
 // dyn / ndyn: the set's dynamic uniform buffer offsets, in binding order (its bindings of that type: compile_program)
 static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t set, int stage, ShaderInfo *si, const float *rscale_row0,
@@ -7521,8 +7625,20 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         prof_set_miss++;
         uint64_t tw_ = prof > 0 ? plat_now_ns() : 0;
         ds = vk_alloc_set(layout);
-        for (int i = 0; i < n; i++) w[i].dstSet = ds;
-        if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+        if (n) {
+            VkDescriptorUpdateTemplate tpl = set < 2 ? p->desc_tpl[set] : VK_NULL_HANDLE;
+            if (tpl && n == plan->nregular + plan->ndeferred) {
+                DescTplSlot slots[MAX_BIND];
+                for (int i = 0; i < n; i++) {
+                    if (w[i].pImageInfo) slots[i].i = ii[i];
+                    else slots[i].b = bi[i];
+                }
+                vkUpdateDescriptorSetWithTemplate(g_vk.dev, ds, tpl, slots);
+            } else {
+                for (int i = 0; i < n; i++) w[i].dstSet = ds;
+                vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+            }
+        }
         if (prof > 0) prof_dsw += plat_now_ns() - tw_;
         int victim = -1;
         for (int way = 0; way < 4; way++) {
@@ -7548,12 +7664,12 @@ static void build_compute(void *arg) {
     CsProg *cp = arg;
     size_t n = 0;
     uint32_t *spv = vk_glsl_to_spirv(cp->si->msl, STAGE_COMPUTE, "cs", &n);
-    if (!spv) { atomic_store(&cp->p.state, 2); return; }
+    if (!spv) { build_signal_done(&cp->p.state, 2); return; }
     cp->p.nbinds = vk_reflect(spv, n, cp->p.binds, MAX_BIND);
     VkShaderModule m = vk_module(spv, n);
     if (!m) {
         free(spv);
-        atomic_store(&cp->p.state, 2);
+        build_signal_done(&cp->p.state, 2);
         return;
     }
     cp->p.layout = make_layout(&cp->p, 1, VK_SHADER_STAGE_COMPUTE_BIT, 0);
@@ -7580,7 +7696,7 @@ static void build_compute(void *arg) {
     }
     vkDestroyShaderModule(g_vk.dev, m, NULL);
     free(spv);
-    atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);  // (last: from here vk_exec_reset may free it; BOTWRecomp 0780cb6)
+    build_signal_done(&cp->p.state, r == VK_SUCCESS ? 1 : 2);  // (last: from here vk_exec_reset may free it; BOTWRecomp 0780cb6)
 }
 
 static void cs_free(CsProg *cp) {
@@ -7589,6 +7705,9 @@ static void cs_free(CsProg *cp) {
         if (atomic_load(&cp->p.state) == 1) atomic_fetch_sub(&live_cpipes, 1);
     }
     if (cp->p.layout) vkDestroyPipelineLayout(g_vk.dev, cp->p.layout, NULL);
+#ifdef __ANDROID__
+    if (cp->p.desc_tpl[0]) vkDestroyDescriptorUpdateTemplate(g_vk.dev, cp->p.desc_tpl[0], NULL);
+#endif
     if (cp->p.set_layout[0]) vkDestroyDescriptorSetLayout(g_vk.dev, cp->p.set_layout[0], NULL);
     maxwell_free(cp->si);  // (cp->p.vi: the same)
     free(cp);
@@ -7958,7 +8077,6 @@ static void draw_(CmdRec *r, bool indexed) {
             fkey.early_z = !(size >= 0x7cc && size < 0x880) && (ctl[0x718] & 1);
         }
     }
-    Prog *pr = get_program(st.program, &vkey, &fkey);
     bool keep = false;  // (a target built once and kept: wait for the shader and pipeline - wait_built)
     {   // (the same targets as the previous draw, same frame: their answer again - reading 6 texture objects a draw
         // showed up)
@@ -7980,6 +8098,7 @@ static void draw_(CmdRec *r, bool indexed) {
         }
         keep = kkeep;
     }
+    Prog *pr = get_program(st.program, &vkey, &fkey, keep);
     if (pr && keep) wait_built(&pr->state);
     if (!pr || atomic_load(&pr->state) != 1) { stat_skipped++; skip_note("shader"); return; }
     // Automatic statically-proven 1:1 framebuffer fetch (subpassLoad + selective ROAA):
@@ -8016,7 +8135,7 @@ static void draw_(CmdRec *r, bool indexed) {
                     ShaderKey ffk = fkey;
                     ffk.fb_fetch_mask = fm;
                     memcpy(ffk.fb_fetch_att, fatt, 16);
-                    fp = get_program(st.program, &vkey, &ffk);
+                    fp = get_program(st.program, &vkey, &ffk, keep);
                     if (fp && keep) wait_built(&fp->state);
                     if (fp && atomic_load(&fp->state) == 1) {
                         pr->fetch_prog = fp;
@@ -8364,6 +8483,37 @@ static void draw_(CmdRec *r, bool indexed) {
             for (int f = 0; f < 2; f++)
                 for (int i = 0; i < 4; i++) fx.sop[f][i] = (uint8_t)sface[f][i];
     }
+    // ---- vertex input state (dynamic via VK_EXT_vertex_input_dynamic_state when supported, else baked in PipeKey)
+    uint32_t dv_attr_mask = 0, dv_used_streams = 0;
+    uint32_t dv_attr_fmt[32], dv_attr_off[32], dv_attr_bind[32];
+    uint32_t dv_stride[17], dv_divisor[17];
+    if (g_vk.dyn_vtx_input) {
+        for (uint32_t m = pr->vi->attr_mask; m; m &= m - 1) {
+            int i = __builtin_ctz(m);
+            dv_attr_mask |= 1u << i;
+            uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
+            uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
+            if (i >= st.nattrib || fmt == 0 || stream >= 16) {
+                dv_attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+                dv_attr_off[i] = 0;
+                dv_attr_bind[i] = ZERO_BINDING;
+                dv_used_streams |= 1u << ZERO_BINDING;
+                continue;
+            }
+            dv_attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
+            dv_attr_off[i] = off;
+            dv_attr_bind[i] = stream;
+            dv_used_streams |= 1u << stream;
+        }
+        dv_stride[ZERO_BINDING] = 0;
+        dv_divisor[ZERO_BINDING] = 0;
+        for (uint32_t m = dv_used_streams & 0xFFFFu; m; m &= m - 1) {
+            int s = __builtin_ctz(m);
+            dv_stride[s] = s < st.nstream ? st.stream[s][0] : 0;
+            dv_divisor[s] = s < st.nstream && dv_stride[s] ? st.stream[s][1] : 0;
+            if (dv_divisor[s] > 1 && !g_vk.divisor) dv_divisor[s] = 1;
+        }
+    }
     // ---- pipeline
     // (last_pipeline: file scope - pipe_evict leaves it alone)
     static int reuse = -1, verify;
@@ -8388,27 +8538,29 @@ static void draw_(CmdRec *r, bool indexed) {
         k.depth = pass_depth;
         k.stencil = pass_stencil;
         k.samples = pass_samples;
-        for (int i = 0; i < 32; i++) {
-            if (!(pr->vi->attr_mask & (1u << i))) continue;
-            k.attr_mask |= 1u << i;
-            uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
-            uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
-            if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) from a constant stream
-                k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
-                k.attr_bind[i] = ZERO_BINDING;
-                k.used_streams |= 1u << ZERO_BINDING;
-                continue;
+        if (!g_vk.dyn_vtx_input) {
+            for (int i = 0; i < 32; i++) {
+                if (!(pr->vi->attr_mask & (1u << i))) continue;
+                k.attr_mask |= 1u << i;
+                uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
+                uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
+                if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) from a constant stream
+                    k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+                    k.attr_bind[i] = ZERO_BINDING;
+                    k.used_streams |= 1u << ZERO_BINDING;
+                    continue;
+                }
+                k.attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
+                k.attr_off[i] = off;
+                k.attr_bind[i] = stream;
+                k.used_streams |= 1u << stream;
             }
-            k.attr_fmt[i] = vertex_format_supported(vertex_format(fmt));
-            k.attr_off[i] = off;
-            k.attr_bind[i] = stream;
-            k.used_streams |= 1u << stream;
-        }
-        for (int s = 0; s < 16; s++) {
-            if (!(k.used_streams & (1u << s))) continue;
-            k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
-            k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
-            if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
+            for (int s = 0; s < 16; s++) {
+                if (!(k.used_streams & (1u << s))) continue;
+                k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
+                k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
+                if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
+            }
         }
         for (uint32_t i = 0; i < k.ncolor && i < 8; i++) {
             if (!st.rt.color[i] || k.color[i] == VK_FORMAT_UNDEFINED) continue;
@@ -8445,10 +8597,10 @@ static void draw_(CmdRec *r, bool indexed) {
             pp = calloc(1, sizeof *pp);
             pp->k = k;
             entry->object = pp;
-            run_job(build_pipeline, pp);
+            run_job_prio(build_pipeline, pp, keep);
         } else if (pp->evicted) {  // (destroyed by pipe_evict: built again)
             pp->evicted = false;
-            run_job(build_pipeline, pp);
+            run_job_prio(build_pipeline, pp, keep);
         }
         // Verification rebuilds the original key to detect missing invalidations during later device tests.
         if (hit && memcmp(&k, &last_pipeline->k, sizeof k)) {
@@ -8470,6 +8622,42 @@ static void draw_(CmdRec *r, bool indexed) {
     pp->used_s = g_exec_s, pp->seq = vk_pending_seq();  // (pipe_evict)
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
+
+    if (g_vk.dyn_vtx_input) {
+        VkVertexInputBindingDescription2EXT vb2[17];
+        VkVertexInputAttributeDescription2EXT va2[32];
+        uint32_t nb = 0, na = 0;
+        for (uint32_t m = dv_used_streams; m; m &= m - 1) {
+            uint32_t s = (uint32_t)__builtin_ctz(m);
+            bool inst_rate = dv_divisor[s] != 0;
+            vb2[nb++] = (VkVertexInputBindingDescription2EXT){
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT,
+                .binding = s, .stride = dv_stride[s],
+                .inputRate = inst_rate ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX,
+                .divisor = inst_rate ? dv_divisor[s] : 1u,
+            };
+        }
+        for (uint32_t m = dv_attr_mask; m; m &= m - 1) {
+            uint32_t i = (uint32_t)__builtin_ctz(m);
+            va2[na++] = (VkVertexInputAttributeDescription2EXT){
+                .sType = VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT,
+                .location = i, .binding = dv_attr_bind[i], .format = dv_attr_fmt[i], .offset = dv_attr_off[i],
+            };
+        }
+        bool same = ss.vtx_nb == nb && ss.vtx_na == na;
+        for (uint32_t i = 0; same && i < nb; i++)
+            same = ss.vtx_b[i].binding == vb2[i].binding && ss.vtx_b[i].stride == vb2[i].stride &&
+                   ss.vtx_b[i].inputRate == vb2[i].inputRate && ss.vtx_b[i].divisor == vb2[i].divisor;
+        for (uint32_t i = 0; same && i < na; i++)
+            same = ss.vtx_a[i].location == va2[i].location && ss.vtx_a[i].binding == va2[i].binding &&
+                   ss.vtx_a[i].format == va2[i].format && ss.vtx_a[i].offset == va2[i].offset;
+        if (ss_need(SS_VTXIN, same)) {
+            ss.vtx_nb = nb; ss.vtx_na = na;
+            if (nb) memcpy(ss.vtx_b, vb2, nb * sizeof vb2[0]);
+            if (na) memcpy(ss.vtx_a, va2, na * sizeof va2[0]);
+            rpCmdSetVertexInputEXT(cb, nb, nb ? vb2 : NULL, na, na ? va2 : NULL);
+        }
+    }
 
     // ---- depth / stencil (dynamic; without extended dynamic state the calls but the masks' do nothing - device.c - and
     // the pipeline has them, PipeKey.fx)
@@ -8731,8 +8919,13 @@ static void draw_(CmdRec *r, bool indexed) {
     }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
+    uint32_t v_used_streams = g_vk.dyn_vtx_input ? dv_used_streams : pp->k.used_streams;
+    uint32_t v_attr_mask = g_vk.dyn_vtx_input ? dv_attr_mask : pp->k.attr_mask;
+    const uint32_t *v_stride = g_vk.dyn_vtx_input ? dv_stride : pp->k.stride;
+    const uint32_t *v_divisor = g_vk.dyn_vtx_input ? dv_divisor : pp->k.divisor;
+    const uint32_t *v_attr_bind = g_vk.dyn_vtx_input ? dv_attr_bind : pp->k.attr_bind;
     for (int s = 0; s < 17; s++) {
-        if (!(pp->k.used_streams & (1u << s))) continue;
+        if (!(v_used_streams & (1u << s))) continue;
         VkSpan sp;
         if (s == ZERO_BINDING) {
             static const float zero[4] = {0, 0, 0, 1};
@@ -8745,9 +8938,9 @@ static void draw_(CmdRec *r, bool indexed) {
             // streams, one vertex's worth, the corners from the vertex index) reads zeros there on the Switch; bound
             // directly, the heap past the stream (the next buffers' data) bent the quad into a hard-edged band.
             uint64_t reach = 0;
-            if (pp->k.stride[s] && !use_index)
-                reach = pp->k.divisor[s] ? ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * pp->k.stride[s]
-                                     : ((uint64_t)first + count) * pp->k.stride[s];
+            if (v_stride[s] && !use_index)
+                reach = v_divisor[s] ? ((uint64_t)base_inst + inst + v_divisor[s] - 1) / v_divisor[s] * v_stride[s]
+                                     : ((uint64_t)first + count) * v_stride[s];
             if (v.addr && v.size && reach > v.size && reach <= (1u << 20)) {
                 sp = vk_transient(reach, 16);
                 memcpy(sp.ptr, (const void *)(uintptr_t)v.addr, v.size);
@@ -8762,18 +8955,18 @@ static void draw_(CmdRec *r, bool indexed) {
             {   // LARECOMP_LOG_VREACH=1 (diagnosis): indexed draws whose largest index reads past a stream's bound size
                 static int on = -1, nlog;
                 if (on < 0) on = getenv("LARECOMP_LOG_VREACH") != NULL;
-                if (on && use_index && pp->k.stride[s] && !pp->k.divisor[s] && v.size && nlog < 60) {
+                if (on && use_index && v_stride[s] && !v_divisor[s] && v.size && nlog < 60) {
                     uint32_t m = 0;
                     if (scan_src) {
                         if (scan_isz == 2) { const uint16_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > m && q[i] != (uint16_t)scan_restart) m = q[i]; }
                         else { const uint32_t *q = scan_src; for (uint32_t i = 0; i < icount; i++) if (q[i] > m && q[i] != scan_restart) m = q[i]; }
                         m += base_vertex > 0 ? (uint32_t)base_vertex : 0;
                     } else m = max_index ? max_index - 1 : 0;
-                    if ((uint64_t)(m + 1) * pp->k.stride[s] > v.size) {
+                    if ((uint64_t)(m + 1) * v_stride[s] > v.size) {
                         nlog++;
                         LOG("[vk] vertex reach: fs %016llx stream %d stride %u size %llu: index %u reads to %llu (frame %llu)\n",
-                            (unsigned long long)g_cur_fs_hash, s, pp->k.stride[s], (unsigned long long)v.size, m,
-                            (unsigned long long)(m + 1) * pp->k.stride[s], (unsigned long long)renderer_present_count());
+                            (unsigned long long)g_cur_fs_hash, s, v_stride[s], (unsigned long long)v.size, m,
+                            (unsigned long long)(m + 1) * v_stride[s], (unsigned long long)renderer_present_count());
                     }
                 }
             }
@@ -8790,9 +8983,9 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (base_vertex > 0) max_index += (uint32_t)base_vertex;
                 scan_src = NULL;
             }
-            uint64_t stride = pp->k.stride[s], need;
+            uint64_t stride = v_stride[s], need;
             if (!stride) need = 256;
-            else if (pp->k.divisor[s]) need = ((uint64_t)base_inst + inst + pp->k.divisor[s] - 1) / pp->k.divisor[s] * stride + 256;
+            else if (v_divisor[s]) need = ((uint64_t)base_inst + inst + v_divisor[s] - 1) / v_divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
@@ -8825,11 +9018,11 @@ static void draw_(CmdRec *r, bool indexed) {
                              (unsigned long long)g_cur_fs_hash, (unsigned long long)pr->code[0], use_index ? "idx" : "n",
                              use_index ? icount : count, inst, base_vertex);
             for (int i = 0; i < 32 && n < (int)sizeof b - 40; i++)
-                if (pp->k.attr_mask >> i & 1) {
+                if (v_attr_mask >> i & 1) {
                     uint32_t a = i < st.nattrib ? st.attrib[i] : 0;
-                    int sb = pp->k.attr_bind[i];
+                    int sb = v_attr_bind[i];
                     n += snprintf(b + n, sizeof b - n, " a%d:%02x@s%d+%u/%u", i, a & 0xFF, sb, a >> 13,
-                                  sb < 16 ? pp->k.stride[sb] : 0);
+                                  sb < 16 ? v_stride[sb] : 0);
                 }
             n += snprintf(b + n, sizeof b - n, " | vs cb");
             for (int k = 0; k < 18 && n < (int)sizeof b - 24; k++)
@@ -9911,14 +10104,14 @@ static void exec_list(uint64_t handle, int depth) {
         case CMD_BIND_POLYGON: pipeline_dirty |= st.poly[2] != ((uint8_t *)x)[2]; memcpy(st.poly, x, 4); break;
         case CMD_BIND_VERTEX_ATTRIB: {
             int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            pipeline_dirty |= n != st.nattrib || memcmp(st.attrib, x, n * 4) != 0;
+            if (!g_vk.dyn_vtx_input) pipeline_dirty |= n != st.nattrib || memcmp(st.attrib, x, n * 4) != 0;
             st.nattrib = n;
             memcpy(st.attrib, x, n * 4);
             break;
         }
         case CMD_BIND_VERTEX_STREAM: {
             int n = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
-            pipeline_dirty |= n != st.nstream || memcmp(st.stream, x, n * 8) != 0;
+            if (!g_vk.dyn_vtx_input) pipeline_dirty |= n != st.nstream || memcmp(st.stream, x, n * 8) != 0;
             st.nstream = n;
             memcpy(st.stream, x, n * 8);
             break;

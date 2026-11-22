@@ -493,6 +493,8 @@ static void create_device(void) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
     VkPhysicalDeviceRasterizationOrderAttachmentAccessFeaturesEXT roaa_have = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_FEATURES_EXT};
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vids_have = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceFeatures2 optional = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
 #define QUERY_OPTIONAL(name, feature) do { if (has_ext(ep, ne, name)) { \
         feature.pNext = optional.pNext; optional.pNext = &feature; } } while (0)
@@ -502,6 +504,7 @@ static void create_device(void) {
     QUERY_OPTIONAL(VK_KHR_MAINTENANCE_5_EXTENSION_NAME, maintenance5_have);
     QUERY_OPTIONAL(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME, executable_have);
     QUERY_OPTIONAL(VK_EXT_RASTERIZATION_ORDER_ATTACHMENT_ACCESS_EXTENSION_NAME, roaa_have);
+    QUERY_OPTIONAL(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME, vids_have);
 #undef QUERY_OPTIONAL
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &optional);
 #endif
@@ -640,6 +643,27 @@ static void create_device(void) {
         } else if (has_ext(ep, ne, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME)) {
             g_vk.store_op_none = true;
             ext[n_ext++] = VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME;
+        }
+    }
+    {
+        // VK_EXT_vertex_input_dynamic_state: moves vertex attribute/stream layout out of PipeKey to dynamic state,
+        // cutting pipeline permutations by >50%. Guard older Mali drivers (< r48 had a stride-binding bug per ANGLE).
+        bool mali_ok = true;
+        if (g_vk.props.vendorID == 0x13B5) {
+            VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+            VkPhysicalDeviceProperties2 p2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+                                              .pNext = driver_props ? &dp : NULL};
+            vkGetPhysicalDeviceProperties2(g_vk.phys, &p2);
+            const char *r = strstr(dp.driverInfo, ".r");
+            if (!r) r = strstr(dp.driverInfo, " r");
+            int rel = r ? atoi(r + 2) : 0;
+            mali_ok = rel >= 48;
+        }
+        const char *dv_e = getenv("LARECOMP_VK_DYN_VTX");
+        bool want_vids = dv_e ? (atoi(dv_e) != 0) : mali_ok;
+        if (want_vids && has_ext(ep, ne, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME) && vids_have.vertexInputDynamicState) {
+            g_vk.dyn_vtx_input = true;
+            ext[n_ext++] = VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME;
         }
     }
 #endif
@@ -945,6 +969,11 @@ static void create_device(void) {
         .rasterizationOrderStencilAttachmentAccess = g_vk.roaa_stencil,
     };
     if (g_vk.roaa_color || g_vk.roaa_depth || g_vk.roaa_stencil) { roaa_f.pNext = f.pNext; f.pNext = &roaa_f; }
+    VkPhysicalDeviceVertexInputDynamicStateFeaturesEXT vids_f = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT,
+        .vertexInputDynamicState = VK_TRUE,
+    };
+    if (g_vk.dyn_vtx_input) { vids_f.pNext = f.pNext; f.pNext = &vids_f; }
 #endif
     float prio = 1.0f;
     VkDeviceQueueCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO, .queueFamilyIndex = g_vk.qfam,
@@ -957,10 +986,11 @@ static void create_device(void) {
 #ifdef __ANDROID__
     volkLoadDevice(g_vk.dev);
     compat_aliases();
+    if (g_vk.dyn_vtx_input && !vkCmdSetVertexInputEXT) g_vk.dyn_vtx_input = false;
     vk_rp_install();  // (LARECOMP_VK_REPLAY: the draws' recording on a thread of its own - replay.h)
     LOG("[vk] Vulkan %u.%u device, %u extensions\n", VK_API_VERSION_MAJOR(g_vk.api), VK_API_VERSION_MINOR(g_vk.api), n_ext);
-    LOG("[vk-cap] raster-order %d/%d/%d (use %d), store-none %d\n",
-        g_vk.roaa_color, g_vk.roaa_depth, g_vk.roaa_stencil, vk_roaa_on(), g_vk.store_op_none);
+    LOG("[vk-cap] raster-order %d/%d/%d (use %d), store-none %d, dyn-vtx %d\n",
+        g_vk.roaa_color, g_vk.roaa_depth, g_vk.roaa_stencil, vk_roaa_on(), g_vk.store_op_none, g_vk.dyn_vtx_input);
 #endif
     vkGetDeviceQueue(g_vk.dev, g_vk.qfam, 0, &g_vk.queue);
 

@@ -56,6 +56,7 @@ typedef struct {
     bool dyn_render;              // VK_KHR_dynamic_rendering in use; without it, classic render passes (rpcompat.c)
     bool roaa_color, roaa_depth, roaa_stencil;  // VK_EXT_rasterization_order_attachment_access supported & enabled
     bool store_op_none;           // VK_KHR_load_store_op_none / VK_EXT_load_store_op_none (skip read-only tile stores)
+    bool dyn_vtx_input;           // VK_EXT_vertex_input_dynamic_state (vertex layout dynamic, out of PipeKey)
     bool sync2;                   // synchronization2 in use; without it, Vulkan 1.0 barriers (device.c sync1_*)
     bool eds;                     // extended dynamic state in use; without it, those states (and extended dynamic state
                                   // 2's) baked into pipelines (exec.c PipeKey.fx)
